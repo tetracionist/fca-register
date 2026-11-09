@@ -1,0 +1,305 @@
+"""Async client for the FCA Financial Services Register API."""
+import asyncio
+import fcntl
+import json
+import math
+import os
+import sys
+import time
+
+import requests
+
+BASE = "https://register.fca.org.uk/services/V0.1"
+# FCA limit is 50 requests per 10 seconds (subject to change); breaching it
+# blocks the account for 1 minute. Stay a little under to absorb jitter.
+MAX_REQUESTS = int(os.environ.get("FCA_MAX_REQUESTS", 45))
+WINDOW = float(os.environ.get("FCA_WINDOW_SECONDS", 10))
+BLOCK_SECONDS = 61
+CONCURRENCY = 10  # requests in flight at once
+STATE_FILE = os.path.expanduser("~/.cache/fca_rate_limit.json")
+
+
+class RateLimiter:
+    """Sliding window shared by every fca_register process via a locked state file:
+    never more than MAX_REQUESTS starts in any WINDOW, and nobody calls while
+    a 429 block is in force."""
+
+    def __init__(self, max_requests, window, path=STATE_FILE):
+        self.max_requests = max_requests
+        self.window = window
+        self.path = path
+        self.lock = asyncio.Lock()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    def _update(self, fn):
+        """Run fn(state, now) under an exclusive file lock; save and return."""
+        with open(self.path, "a+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            f.seek(0)
+            try:
+                state = json.loads(f.read() or "{}")
+            except ValueError:
+                state = {}
+            now = time.time()
+            state["starts"] = [
+                t for t in state.get("starts", []) if now - t < self.window
+            ]
+            result = fn(state, now)
+            f.seek(0)
+            f.truncate()
+            f.write(json.dumps(state))
+            return result
+
+    def _try_acquire(self, state, now):
+        """Take a slot and return 0, or return how long to wait."""
+        blocked_until = state.get("blocked_until", 0)
+        if now < blocked_until:
+            return blocked_until - now
+        starts = state["starts"]
+        if len(starts) < self.max_requests:
+            starts.append(now)
+            return 0
+        return min(starts) + self.window - now
+
+    async def wait(self):
+        async with self.lock:
+            while True:
+                delay = await asyncio.to_thread(self._update, self._try_acquire)
+                if delay <= 0:
+                    return
+                await asyncio.sleep(delay)
+
+    async def blocked(self):
+        """Record a 429 so every process holds off for the block period."""
+        def mark(state, now):
+            state["blocked_until"] = max(
+                state.get("blocked_until", 0), now + BLOCK_SECONDS
+            )
+        await asyncio.to_thread(self._update, mark)
+
+
+class Client:
+    def __init__(self, email=None, api_key=None):
+        """Credentials default to FCA_API_EMAIL and FCA_API_KEY."""
+        email = email or os.environ.get("FCA_API_EMAIL")
+        api_key = api_key or os.environ.get("FCA_API_KEY")
+        if not email or not api_key:
+            raise ValueError(
+                "FCA credentials missing: pass email and api_key, or set "
+                "FCA_API_EMAIL and FCA_API_KEY"
+            )
+        self.session = requests.Session()
+        self.session.headers.update({
+            "X-Auth-Email": email,
+            "X-Auth-Key": api_key,
+            "Content-Type": "application/json",
+        })
+        self.limiter = RateLimiter(MAX_REQUESTS, WINDOW)
+        self.in_flight = asyncio.Semaphore(CONCURRENCY)
+
+    async def get_page(self, url, params=None):
+        """Call the API once, back off on rate limits, return the JSON body."""
+        for _ in range(3):
+            async with self.in_flight:
+                await self.limiter.wait()
+                r = await asyncio.to_thread(
+                    self.session.get, url, params=params, timeout=30
+                )
+            if r.status_code == 429:
+                print(f"Rate limited; waiting {BLOCK_SECONDS}s", file=sys.stderr)
+                await self.limiter.blocked()  # wait() then sleeps it out
+                continue
+            r.raise_for_status()
+            return r.json()
+        raise RuntimeError(f"Rate limited on {url}")
+
+    async def get(self, path, params=None, max_rows=None):
+        """Return the Data for path across pages, fetching pages concurrently.
+
+        Most endpoints return a list; some (Permissions, AR) return a dict of
+        lists, which are merged key by key. max_rows stops after enough pages.
+        Returns (data, total_count).
+        """
+        params = dict(params or {})
+        url = f"{BASE}/{path}"
+        first = await self.get_page(url, params)
+        data = first.get("Data") or []
+        info = first.get("ResultInfo") or {}
+        total = int(info.get("total_count") or 0)
+        per_page = int(info.get("per_page") or 0)
+
+        if info.get("Next") and total and per_page:
+            wanted = total if not max_rows else min(total, max_rows)
+            pages = range(2, math.ceil(wanted / per_page) + 1)
+            bodies = await asyncio.gather(
+                *(self.get_page(url, {**params, "pgnp": p}) for p in pages)
+            )
+            for body in bodies:
+                merge(data, body.get("Data") or [])
+        else:
+            # No count to plan with: fall back to following Next one by one.
+            next_url = info.get("Next")
+            while next_url and not (max_rows and len(data) >= max_rows):
+                body = await self.get_page(next_url)
+                merge(data, body.get("Data") or [])
+                next_url = (body.get("ResultInfo") or {}).get("Next")
+
+        if max_rows and isinstance(data, list):
+            data = data[:max_rows]
+        return data, total
+
+    async def search(self, name, limit=20):
+        """Find firms by name. Returns FRN, name and status for each match."""
+        rows, total = await self.get(
+            "Search", {"q": name, "type": "firm"}, max_rows=limit or None
+        )
+        print(f"{len(rows)} of {total or len(rows)} matches", file=sys.stderr)
+        return [
+            {
+                "fca_frn": row.get("Reference Number"),
+                "name": row.get("Name"),
+                "status": row.get("Status"),
+            }
+            for row in rows
+        ]
+
+    async def firm(self, frn):
+        """Everything the playbook needs about one firm, fetched in parallel."""
+        parts = [
+            "", "/Names", "/Permissions", "/Individuals", "/AR",
+            "/Address", "/DisciplinaryHistory", "/Requirements",
+        ]
+        results = await asyncio.gather(
+            *(self.get(f"Firm/{frn}{p}") for p in parts)
+        )
+        (details, names, perms, people, ars,
+         addresses, disciplinary, requirements) = (data for data, _ in results)
+        if not details:
+            # The API answers 200 with an empty Data for an unknown FRN.
+            raise LookupError(f"No firm found with FRN {frn}")
+        return {
+            "fca_frn": frn,
+            "details": details[0],
+            "trading_names": tidy_trading_names(names),
+            "permissions": tidy_permissions(perms),
+            "individuals": people,
+            "appointed_reps": tidy_appointed_reps(ars),
+            # Passed through as the API returns them (not yet tidied).
+            "addresses": addresses,
+            "disciplinary_history": disciplinary,
+            "requirements": requirements,
+            "source_url": f"https://register.fca.org.uk/s/firm?id={frn}",
+            "read_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+
+
+PERMISSION_FIELDS = {
+    "Customer Type": "customer_types",
+    "Investment Type": "investment_types",
+    "Limitation": "limitations",
+}
+
+
+def tidy_permissions(raw):
+    """Turn {activity: [{"Customer Type": [...]}, ...]} into one flat record
+    per activity. "Limitation Not Found" just means no limitation, so it is
+    dropped; any other unexpected key is kept in snake_case."""
+    tidy = []
+    for activity, items in (raw or {}).items():
+        record = {
+            "activity": activity,
+            "customer_types": [],
+            "investment_types": [],
+            "limitations": [],
+        }
+        for item in items or []:
+            for key, values in (item or {}).items():
+                if key == "Limitation Not Found":
+                    continue
+                field = PERMISSION_FIELDS.get(key) or key.lower().replace(" ", "_")
+                record.setdefault(field, []).extend(values or [])
+        tidy.append(record)
+    return tidy
+
+
+def iso_date(value):
+    """'28/03/2021' -> '2021-03-28'; anything else is passed through."""
+    try:
+        day, month, year = value.split("/")
+        return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+    except (AttributeError, ValueError):
+        return value or None
+
+
+def snake(key):
+    return key.lower().replace(" ", "_")
+
+
+def newest_first(records):
+    """Current before previous, then most recent effective_from first."""
+    by_date = sorted(records, key=lambda r: r.get("effective_from") or "", reverse=True)
+    return sorted(by_date, key=lambda r: not r["current"])  # stable sort
+
+
+def tidy_trading_names(raw):
+    """[{"Current Names": [...]}, {"Previous Names": [...]}] -> flat list."""
+    known = {"Name", "Status", "Effective From", "Effective To"}
+    tidy = []
+    for group in raw or []:
+        for label, rows in (group or {}).items():
+            current = label.lower().startswith("current")
+            for row in rows or []:
+                record = {
+                    "name": row.get("Name"),
+                    "type": (row.get("Status") or "").lower() or None,
+                    "current": current,
+                    "effective_from": iso_date(row.get("Effective From")),
+                    "effective_to": iso_date(row.get("Effective To")),
+                }
+                record.update(
+                    {snake(k): v for k, v in row.items() if k not in known}
+                )
+                tidy.append(record)
+    return newest_first(tidy)
+
+
+def tidy_appointed_reps(raw):
+    """{"CurrentAppointedRepresentatives": [...], "Previous...": [...]} ->
+    flat list. Principal FRN/name (always this firm), the API URL (just the
+    FRN again) and the FCA's [NotinUse] field are dropped."""
+    dropped = {"URL", "Principal FRN", "Principal Firm Name"}
+    known = {
+        "FRN", "Name", "RecordSubType", "Effective Date", "Termination Date",
+        "Tied Agent", "EEA Tied Agent",
+    }
+    flag = lambda v: str(v).lower() == "true" if v is not None else None
+    tidy = []
+    for label, rows in (raw or {}).items():
+        current = label.lower().startswith("current")
+        for row in rows or []:
+            frn = row.get("FRN")
+            record = {
+                "fca_frn": frn,
+                "name": row.get("Name"),
+                "type": (row.get("RecordSubType") or "").lower() or None,
+                "current": current,
+                "effective_from": iso_date(row.get("Effective Date")),
+                "effective_to": iso_date(row.get("Termination Date")),
+                "tied_agent": flag(row.get("Tied Agent")),
+                "eea_tied_agent": flag(row.get("EEA Tied Agent")),
+                "source_url": f"https://register.fca.org.uk/s/firm?id={frn}",
+            }
+            record.update({
+                snake(k): v for k, v in row.items()
+                if k not in known | dropped and not k.startswith("[NotinUse]")
+            })
+            tidy.append(record)
+    return newest_first(tidy)
+
+
+def merge(data, page):
+    if isinstance(data, dict):
+        for key, rows in (page or {}).items():
+            data[key] = (data.get(key) or []) + (rows or [])
+    else:
+        data.extend(page)
