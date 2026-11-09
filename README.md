@@ -1,6 +1,6 @@
 # fca-register
 
-Async Python client and command-line tool for the
+Async Python client, command-line tool and MCP server for the
 [FCA Financial Services Register API](https://register.fca.org.uk/Developer/s/).
 
 It stays under the FCA rate limit (50 requests per 10 seconds) with a sliding
@@ -45,6 +45,35 @@ async def main():
     print(firm["permissions"])
 
 asyncio.run(main())
+```
+
+## MCP server
+
+A thin [MCP](https://modelcontextprotocol.io) server exposes two tools,
+`search_firms(name, limit=20)` and `get_firm(frn)`, over stdio. It needs
+Python 3.10+:
+
+```sh
+pip install "fca-register[mcp]"
+```
+
+Add it to Claude Code:
+
+```sh
+claude mcp add fca-register -e FCA_API_EMAIL=you@example.com -e FCA_API_KEY=your-key -- fca-register-mcp
+```
+
+Or add it to any client that reads an `mcpServers` config:
+
+```json
+{
+  "mcpServers": {
+    "fca-register": {
+      "command": "fca-register-mcp",
+      "env": { "FCA_API_EMAIL": "you@example.com", "FCA_API_KEY": "your-key" }
+    }
+  }
+}
 ```
 
 ## Settings
