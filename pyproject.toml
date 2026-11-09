@@ -21,8 +21,8 @@ classifiers = [
 dependencies = ["requests>=2.25"]
 
 [project.urls]
-Homepage = "https://github.com/tetracionist/fca-api"
-Issues = "https://github.com/tetracionist/fca-api/issues"
+Homepage = "https://github.com/tetracionist/fca-register"
+Issues = "https://github.com/tetracionist/fca-register/issues"
 
 [project.scripts]
 fca-register = "fca_register.cli:run"
