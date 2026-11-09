@@ -15,7 +15,7 @@ import asyncio
 import json
 import sys
 
-from .client import Client
+from .client import Client, FcaApiError
 
 
 async def main(argv):
@@ -40,7 +40,7 @@ async def main(argv):
             result = await client.search(arg, limit)
         else:
             result = await client.firm(arg, appointed_reps=with_ar)
-    except (LookupError, ValueError) as e:
+    except (LookupError, ValueError, FcaApiError) as e:
         sys.exit(str(e))
     print(json.dumps(result, indent=2))
 

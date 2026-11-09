@@ -6,7 +6,7 @@ Needs FCA_API_EMAIL and FCA_API_KEY in the environment.
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from .client import Client
+from .client import Client, FcaApiError
 
 mcp = MCPServer("fca-register")
 _client = None
@@ -30,7 +30,7 @@ async def search_firms(name: str, limit: int = 20) -> list[dict]:
     """
     try:
         return await client().search(name, limit)
-    except (LookupError, ValueError) as e:
+    except (LookupError, ValueError, FcaApiError) as e:
         raise ToolError(str(e)) from e
 
 
@@ -46,7 +46,7 @@ async def get_firm(frn: str, include_appointed_reps: bool = False) -> dict:
     """
     try:
         return await client().firm(frn, appointed_reps=include_appointed_reps)
-    except (LookupError, ValueError) as e:
+    except (LookupError, ValueError, FcaApiError) as e:
         # MCP only passes ToolError messages back to the model.
         raise ToolError(str(e)) from e
 

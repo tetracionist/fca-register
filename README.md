@@ -47,6 +47,15 @@ async def main():
 asyncio.run(main())
 ```
 
+## Errors
+
+The API usually answers HTTP 200 and puts its result code (`FSR-API-…`) in
+the body. "No record" codes come back as empty data. Error codes raise
+`FcaAuthError` (bad key or email, also a `PermissionError`),
+`FcaBadRequestError` (bad FRN or search string, also a `ValueError`) or
+`FcaSystemError` (FCA-side failure, also a `RuntimeError`). All three are
+subclasses of `FcaApiError` and carry `.code` and `.message`.
+
 ## MCP server
 
 A thin [MCP](https://modelcontextprotocol.io) server exposes two tools,

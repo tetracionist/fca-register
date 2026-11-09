@@ -19,6 +19,56 @@ CONCURRENCY = 10  # requests in flight at once
 STATE_FILE = os.path.expanduser("~/.cache/fca_rate_limit.json")
 
 
+class FcaApiError(Exception):
+    """The API answered (usually HTTP 200) with an error code in the body."""
+
+    def __init__(self, code, message):
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
+
+
+class FcaAuthError(FcaApiError, PermissionError):
+    """Bad or missing API key or email (FSR-API-01-*)."""
+
+
+class FcaBadRequestError(FcaApiError, ValueError):
+    """The API rejected the input, e.g. a malformed FRN or search string."""
+
+
+class FcaSystemError(FcaApiError, RuntimeError):
+    """The FCA's side failed (FSR-API-99-*) or sent a code we don't know."""
+
+
+# FSR-API-<api>-<endpoint>-<result>. Result 00 is success, 11 is "no
+# record", 22 is "page not found"; 21 and 31 are bad input. The FCA docs
+# swap 11 and 21 for Firm Requirements, so those two are listed by hand.
+NOT_FOUND_CODES = {"FSR-API-02-06-21"}
+BAD_REQUEST_CODES = {"FSR-API-02-06-11"}
+
+
+def check_status(body):
+    """Raise FcaApiError if the body carries an error code; return True if
+    it says there is no data, False if it is a normal success."""
+    code = body.get("Status") if isinstance(body, dict) else None
+    if not isinstance(code, str) or not code.startswith("FSR-API-"):
+        return False  # no code to go on; trust the HTTP status
+    message = body.get("Message") or ""
+    parts = code.split("-")
+    api, result = parts[2], parts[-1]
+    if code in BAD_REQUEST_CODES:
+        raise FcaBadRequestError(code, message)
+    if result == "00":
+        return False
+    if api == "01":
+        raise FcaAuthError(code, message)
+    if code in NOT_FOUND_CODES or result in ("11", "22"):
+        return True
+    if result in ("21", "31"):
+        raise FcaBadRequestError(code, message)
+    raise FcaSystemError(code, message)
+
+
 class RateLimiter:
     """Sliding window shared by every fca_register process via a locked state file:
     never more than MAX_REQUESTS starts in any WINDOW, and nobody calls while
@@ -133,7 +183,10 @@ class Client:
                 # Some sub-endpoints 404 when a firm has nothing to show.
                 return {}
             r.raise_for_status()
-            return r.json()
+            body = r.json()
+            if check_status(body):
+                return {}
+            return body
         raise RuntimeError(f"Rate limited on {url}")
 
     async def get(self, path, params=None, max_rows=None):
@@ -176,15 +229,22 @@ class Client:
         rows, total = await self.get(
             "Search", {"q": name, "type": "firm"}, max_rows=limit or None
         )
-        print(f"{len(rows)} of {total or len(rows)} matches", file=sys.stderr)
-        return [
-            {
-                "fca_frn": row.get("Reference Number"),
+        # The API's ordering shifts slightly between pages, so pages fetched
+        # in parallel can repeat a row; keep the first of each.
+        seen = set()
+        matches = []
+        for row in rows:
+            frn = row.get("Reference Number")
+            if frn in seen:
+                continue
+            seen.add(frn)
+            matches.append({
+                "fca_frn": frn,
                 "name": row.get("Name"),
                 "status": row.get("Status"),
-            }
-            for row in rows
-        ]
+            })
+        print(f"{len(matches)} of {total or len(matches)} matches", file=sys.stderr)
+        return matches
 
     async def firm(self, frn, appointed_reps=False):
         """Everything the playbook needs about one firm, fetched in parallel.

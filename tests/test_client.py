@@ -98,3 +98,59 @@ def test_appointed_reps_are_opt_in(make_client):
     seen.clear()
     asyncio.run(c.firm("1", appointed_reps=True))
     assert any(u.endswith("/AR") for u in seen)
+
+
+def body(code, data=None, message="msg"):
+    return FakeResponse(200, {"Status": code, "Message": message, "Data": data})
+
+
+@pytest.mark.parametrize("code", [
+    "FSR-API-02-01-11",  # firm not found
+    "FSR-API-02-11-11",  # disciplinary history not found
+    "FSR-API-02-04-22",  # names: page not found
+    "FSR-API-04-01-11",  # no search result
+    "FSR-API-02-06-21",  # requirements not found (docs swap -11/-21 here)
+])
+def test_not_found_codes_are_empty(make_client, code):
+    c = make_client({"Firm/1/X": body(code)})
+    assert asyncio.run(c.get("Firm/1/X")) == ([], 0)
+
+
+@pytest.mark.parametrize("code, exc_type", [
+    ("FSR-API-01-01-11", PermissionError),  # unauthorised
+    ("FSR-API-01-01-21", PermissionError),  # API and email key not found
+    ("FSR-API-02-01-21", ValueError),       # bad FRN
+    ("FSR-API-02-06-11", ValueError),       # requirements bad request (swapped)
+    ("FSR-API-02-03-31", ValueError),       # garbage parameter
+    ("FSR-API-04-01-21", ValueError),       # bad search string
+    ("FSR-API-99-01-01", RuntimeError),     # system error
+    ("FSR-API-99-99-99", RuntimeError),     # catch-all
+])
+def test_error_codes_raise(make_client, code, exc_type):
+    from fca_register import FcaApiError
+
+    c = make_client({"Firm/1/X": body(code, message="boom")})
+    with pytest.raises(FcaApiError) as info:
+        asyncio.run(c.get("Firm/1/X"))
+    assert isinstance(info.value, exc_type)
+    assert info.value.code == code
+    assert code in str(info.value) and "boom" in str(info.value)
+
+
+def test_bad_credentials_are_not_reported_as_missing_firm(make_client):
+    c = make_client({"Firm/1": body("FSR-API-01-01-11", message="Unauthorised")})
+    with pytest.raises(PermissionError, match="Unauthorised"):
+        asyncio.run(c.firm("1"))
+
+
+def test_search_drops_rows_repeated_across_pages(make_client):
+    def row(ref):
+        return {"Reference Number": ref, "Name": ref, "Status": "Authorised"}
+
+    info = {"Next": "x", "total_count": "3", "per_page": "2"}
+    page1 = FakeResponse(200, {"Status": "FSR-API-04-01-00", "Data": [row("A"), row("B")], "ResultInfo": info})
+    page2 = FakeResponse(200, {"Status": "FSR-API-04-01-00", "Data": [row("B"), row("C")], "ResultInfo": {}})
+    c = make_client({})
+    c.session.get = lambda url, params=None, timeout=None: page2 if (params or {}).get("pgnp") == 2 else page1
+    rows = asyncio.run(c.search("x", limit=0))
+    assert [r["fca_frn"] for r in rows] == ["A", "B", "C"]
