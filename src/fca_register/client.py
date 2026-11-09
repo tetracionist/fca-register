@@ -28,7 +28,8 @@ class RateLimiter:
         self.max_requests = max_requests
         self.window = window
         self.path = path
-        self.lock = asyncio.Lock()
+        self._lock = None
+        self._loop = None
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
     def _update(self, fn):
@@ -60,6 +61,16 @@ class RateLimiter:
             starts.append(now)
             return 0
         return min(starts) + self.window - now
+
+    @property
+    def lock(self):
+        # Made inside the running loop, and remade if the loop changes:
+        # asyncio primitives bind to a loop (on Python 3.9, to whatever
+        # loop exists when they are created).
+        loop = asyncio.get_running_loop()
+        if self._loop is not loop:
+            self._lock, self._loop = asyncio.Lock(), loop
+        return self._lock
 
     async def wait(self):
         async with self.lock:
@@ -95,7 +106,16 @@ class Client:
             "Content-Type": "application/json",
         })
         self.limiter = RateLimiter(MAX_REQUESTS, WINDOW)
-        self.in_flight = asyncio.Semaphore(CONCURRENCY)
+        self._in_flight = None
+        self._loop = None
+
+    @property
+    def in_flight(self):
+        # Per event loop, for the same reason as RateLimiter.lock.
+        loop = asyncio.get_running_loop()
+        if self._loop is not loop:
+            self._in_flight, self._loop = asyncio.Semaphore(CONCURRENCY), loop
+        return self._in_flight
 
     async def get_page(self, url, params=None):
         """Call the API once, back off on rate limits, return the JSON body."""
@@ -109,6 +129,9 @@ class Client:
                 print(f"Rate limited; waiting {BLOCK_SECONDS}s", file=sys.stderr)
                 await self.limiter.blocked()  # wait() then sleeps it out
                 continue
+            if r.status_code == 404:
+                # Some sub-endpoints 404 when a firm has nothing to show.
+                return {}
             r.raise_for_status()
             return r.json()
         raise RuntimeError(f"Rate limited on {url}")
@@ -163,33 +186,68 @@ class Client:
             for row in rows
         ]
 
-    async def firm(self, frn):
-        """Everything the playbook needs about one firm, fetched in parallel."""
-        parts = [
-            "", "/Names", "/Permissions", "/Individuals", "/AR",
-            "/Address", "/DisciplinaryHistory", "/Requirements",
-        ]
+    async def firm(self, frn, appointed_reps=False):
+        """Everything the playbook needs about one firm, fetched in parallel.
+
+        Appointed representatives are skipped unless appointed_reps is True:
+        a firm with a big AR network takes many pages to fetch.
+
+        If a sub-endpoint fails, its field is None and the error is listed
+        under "errors"; only a failure of the main firm record raises.
+        """
+        parts = {
+            "details": "",
+            "trading_names": "/Names",
+            "permissions": "/Permissions",
+            "individuals": "/Individuals",
+            "addresses": "/Address",
+            "disciplinary_history": "/DisciplinaryHistory",
+            "requirements": "/Requirements",
+        }
+        if appointed_reps:
+            parts["appointed_reps"] = "/AR"
         results = await asyncio.gather(
-            *(self.get(f"Firm/{frn}{p}") for p in parts)
+            *(self.get(f"Firm/{frn}{p}") for p in parts.values()),
+            return_exceptions=True,
         )
-        (details, names, perms, people, ars,
-         addresses, disciplinary, requirements) = (data for data, _ in results)
+        got = dict(zip(parts, results))
+        details = got.pop("details")
+        if isinstance(details, BaseException):
+            raise details
+        details = details[0]  # (data, total) -> data
         if not details:
             # The API answers 200 with an empty Data for an unknown FRN.
             raise LookupError(f"No firm found with FRN {frn}")
+
+        errors = {}
+        data = {}
+        for key, result in got.items():
+            if isinstance(result, Exception):
+                errors[key] = f"{type(result).__name__}: {result}"
+                data[key] = None
+            elif isinstance(result, BaseException):
+                raise result  # cancellation and the like
+            else:
+                data[key] = result[0]
+
+        def tidied(key, fn):
+            return None if data.get(key) is None else fn(data[key])
+
         return {
             "fca_frn": frn,
             "details": details[0],
-            "trading_names": tidy_trading_names(names),
-            "permissions": tidy_permissions(perms),
-            "individuals": people,
-            "appointed_reps": tidy_appointed_reps(ars),
+            "trading_names": tidied("trading_names", tidy_trading_names),
+            "permissions": tidied("permissions", tidy_permissions),
+            "individuals": data["individuals"],
+            # None unless asked for (or if the fetch failed).
+            "appointed_reps": tidied("appointed_reps", tidy_appointed_reps),
             # Passed through as the API returns them (not yet tidied).
-            "addresses": addresses,
-            "disciplinary_history": disciplinary,
-            "requirements": requirements,
+            "addresses": data["addresses"],
+            "disciplinary_history": data["disciplinary_history"],
+            "requirements": data["requirements"],
             "source_url": f"https://register.fca.org.uk/s/firm?id={frn}",
             "read_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "errors": errors,
         }
 
 

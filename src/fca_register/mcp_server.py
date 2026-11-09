@@ -35,14 +35,17 @@ async def search_firms(name: str, limit: int = 20) -> list[dict]:
 
 
 @mcp.tool()
-async def get_firm(frn: str) -> dict:
+async def get_firm(frn: str, include_appointed_reps: bool = False) -> dict:
     """Get one firm's full FCA Register record by its reference number (FRN).
 
-    Includes details, trading names, permissions, individuals, appointed
-    representatives, addresses, disciplinary history and requirements.
+    Includes details, trading names, permissions, individuals, addresses,
+    disciplinary history and requirements. Appointed representatives are
+    fetched only if include_appointed_reps is true, because firms with large
+    AR networks are slow to fetch. A sub-section that fails to load is None,
+    with the reason under "errors".
     """
     try:
-        return await client().firm(frn)
+        return await client().firm(frn, appointed_reps=include_appointed_reps)
     except (LookupError, ValueError) as e:
         # MCP only passes ToolError messages back to the model.
         raise ToolError(str(e)) from e

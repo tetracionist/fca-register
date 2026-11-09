@@ -27,7 +27,7 @@ export FCA_API_KEY=your-key
 
 ```sh
 fca-register search "Harbour Underwriting" [--limit N]   # --limit 0 = all
-fca-register firm 123456
+fca-register firm 123456 [--with-ar]                     # appointed reps are opt-in
 ```
 
 Both print JSON to stdout. `python -m fca_register` works too.
@@ -50,7 +50,8 @@ asyncio.run(main())
 ## MCP server
 
 A thin [MCP](https://modelcontextprotocol.io) server exposes two tools,
-`search_firms(name, limit=20)` and `get_firm(frn)`, over stdio. It needs
+`search_firms(name, limit=20)` and
+`get_firm(frn, include_appointed_reps=False)`, over stdio. It needs
 Python 3.10+:
 
 ```sh

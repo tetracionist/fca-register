@@ -13,10 +13,10 @@ class FakeClient:
     async def search(self, name, limit):
         return [{"fca_frn": "123456", "name": name, "status": "Authorised", "limit": limit}]
 
-    async def firm(self, frn):
+    async def firm(self, frn, appointed_reps=False):
         if frn != "123456":
             raise LookupError(f"No firm found with FRN {frn}")
-        return {"fca_frn": frn}
+        return {"fca_frn": frn, "appointed_reps": [] if appointed_reps else None}
 
 
 @pytest.fixture(autouse=True)
@@ -45,3 +45,9 @@ def test_missing_credentials_is_a_tool_error(monkeypatch):
     monkeypatch.delenv("FCA_API_KEY", raising=False)
     with pytest.raises(ToolError, match="FCA credentials missing"):
         asyncio.run(mcp_server.mcp.call_tool("search_firms", {"name": "x"}))
+
+
+def test_get_firm_passes_appointed_reps_flag():
+    assert asyncio.run(mcp_server.get_firm("123456"))["appointed_reps"] is None
+    result = asyncio.run(mcp_server.get_firm("123456", include_appointed_reps=True))
+    assert result["appointed_reps"] == []
